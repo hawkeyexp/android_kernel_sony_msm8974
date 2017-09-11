@@ -463,3 +463,6 @@ CFLAGS_board-rdtags.o  := \
 	-D"INFO_BUILDID=\"$(if $(SEMC_SYSTEM_VERSION),$(SEMC_SYSTEM_VERSION),private)\""
 
 CFLAGS_board-8974-console.o += -Idrivers/staging/android
+obj-$(CONFIG_ALUCARD_HOTPLUG) += alucard_hotplug.o
+obj-$(CONFIG_ZEN_DECISION) += msm_zen_decision.o
+obj-$(CONFIG_FAST_HOTPLUG) += fast_hotplug.o
