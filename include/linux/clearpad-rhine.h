@@ -18,7 +18,7 @@
 #include <linux/kernel.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
-
+#include <linux/input/evgen_helper.h>
 
 #define CLEARPAD_NAME "clearpad"
 #define CLEARPADI2C_NAME "clearpad-i2c"
