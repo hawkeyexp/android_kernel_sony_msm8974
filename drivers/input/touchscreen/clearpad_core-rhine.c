@@ -70,24 +70,15 @@
 #define SYNAPTICS_WAKEUP_GESTURE		"wakeup_gesture"
 #define SYN_ADDRESS(th, func, type, addr) ((th)->pdt[func].base[type] + (addr))
 #define SYN_PAGE(th, func) ((th)->pdt[func].page)
-#define SYN_PAGE_ADDR(page, addr) ((page) << 8 | (addr))
-#define SYN_F_ADDR(th, func, type, reg) ((th)->pdt[func].base[type] + (reg))
-#define SYN_F_PAGE_ADDR(th, func, type, reg) \
-	SYN_PAGE_ADDR(SYN_PAGE(th, func), SYN_ADDRESS(th, func, type, reg))
 #define SYNSET(...)  __VA_ARGS__
-#define SYNI(th, func, type, reg) \
-	SYNSET(th, SYN_F_PAGE_ADDR(th, func, type, reg))
 #define SYNX(x) SYN_##x
 #define SYNY(y) SYN_TYPE_##y
 #define SYNF(x, y, a) SYNSET(SYNX(x), SYNY(y), a)
-#define SYNF3(th, func, type, reg) \
-	SYNI(th, SYNX(func), SYNY(type), reg)
+
 #define SYN_OFFSET(th, func, type, sym) \
 	((th)->pdt[SYNX(func)].offset[SYNY(type)][func##_##type##_##sym])
 #define SYNF2(th, x, y, r) SYNSET(th, SYNX(x), SYNY(y), SYN_OFFSET(th, x, y, r))
-#define SYNS(th, func, type, sym) \
-	SYNSET(th, SYN_F_PAGE_ADDR(th, SYNFUNC(func), SYNTYPE(type), \
-				   SYNOFF(th, func, type, sym)))
+
 #define DEVICE_STATUS_UNCONFIGURED_RESET_OCCURRED	0x81
 #define DEVICE_STATUS_UNCONFIGURED_DEVICE_FAILURE	0x83
 #define DEVICE_STATUS_DEVICE_FAILURE			0x03
@@ -106,14 +97,13 @@
 #define PEN_DETECT_INT_DISABLE				0x00
 #define GLOVE_MODE_ENABLE				0x01
 #define GLOVE_MODE_DISABLE				0x02
-#define EW_DOUBLE_TAP_ENABLE				0x01
-#define EW_DOUBLE_TAP_DISABLE				0x00
-#define EW_RPT_GESTURE_ENABLE				0x02
-#define EW_RPT_GESTURE_DISABLE				0x00
 #define XY_REPORTING_MODE				0x07
 #define XY_HAS_LPWG					0x10
 #define XY_REPORTING_MODE_REDUCED_REPORTING_MODE	0x01
 #define XY_REPORTING_MODE_WAKEUP_GESTURE_MODE		0x04
+#define XY_LPWG_STATUS_DOUBLE_TAP_DETECTED		0x01
+#define XY_LPWG_STATUS_SWIPE_DETECTED			0x02
+#define XY_LPWG_STATUS_TWO_SWIPE_DETECTED		0x04
 #define FLASH_CONTROL_WRITE_FIRMWARE_BLOCK		0x02
 #define FLASH_CONTROL_ERASE_ALL				0x03
 #define FLASH_CONTROL_WRITE_CONFIGURATION_BLOCK		0x06
@@ -382,15 +372,7 @@ struct synaptics_extents {
 	int n_fingers;
 	int n_bytes_per_object;
 };
-struct synaptics_wakeup_gesture {
-	bool supported;
-	bool enabled;
-	bool engaged;
-	bool lpm_disabled;
-	bool large_panel;
-	unsigned long time_started;
-	u32 timeout_delay;
-};
+
 enum hwtest_data_type {
 	HWTEST_NULL,
 	HWTEST_U8,
@@ -452,8 +434,8 @@ struct synaptics_clearpad {
 	struct synaptics_pointer pointer[SYNAPTICS_MAX_N_FINGERS];
 	struct synaptics_function_descriptor pdt[SYN_N_FUNCTIONS];
 	struct synaptics_flash_image flash;
-	struct synaptics_wakeup_gesture wakeup_gesture;
-	
+	struct synaptics_easy_wakeup_config easy_wakeup_config;
+
 	bool fwdata_available;
 	enum synaptics_flash_modes flash_mode;
 	struct synaptics_extents extents;
@@ -480,6 +462,7 @@ struct synaptics_clearpad {
 	u32 touch_size_enabled;
 	u32 touch_orientation_enabled;
 	struct device_node *evdt_node;
+	u32 wakeup_gesture_support;
 	unsigned long ew_timeout;
 	struct delayed_work wd_poll_work;
 	int wd_poll_t_jf;
@@ -861,16 +844,6 @@ exit:
 	return rc;
 }
 
-static int synaptics_clearpad_set_wakeup_gesture(struct syanptics_clearpad *this, int enable)
-{
-	int rc = 0;
-
-	rc = synaptics_put(this, SYNF3(this, F12_2D, CTRL, 0x0C),
-		enable ? EW_DOUBLE_TAP_ENABLE : EW_DOUBLE_TAP_DISABLE);
-	if (rc)
-		dev_err(&this->pdev->dev, "failed to set wakeup gesture");
-	return rc;
-}
 static u8 synaptics_gen_offsets(u8 desc, u8 offset_from, u8 reg_array[],
 	int reg_from, int array_size)
 {
@@ -880,7 +853,7 @@ static u8 synaptics_gen_offsets(u8 desc, u8 offset_from, u8 reg_array[],
 
 	for (bit = 0; bit < 8 && reg < array_size; bit++)
 		reg_array[reg++] = desc & (1 << bit) ? offset++ : unused_offset;
-e
+
 	return offset;
 }
 
@@ -1791,9 +1764,7 @@ static int synaptics_clearpad_set_normal_mode(struct synaptics_clearpad *this)
 
 	dev_dbg(&this->pdev->dev, "%s\n", __func__);
 
-	if (this->wakeup_gesture.enabled) {
-		if (!this->wakeup_gesture.lpm_disabled) {
-			rc = clearpad_vreg_suspend(this, 0);
+	rc = clearpad_vreg_suspend(this, 0);
 	if (rc)
 		goto exit;
 	usleep_range(10000, 11000);
@@ -1814,54 +1785,7 @@ static int synaptics_clearpad_set_normal_mode(struct synaptics_clearpad *this)
 				"failed to exit wakeup gesture mode\n");
 			goto exit;
 		}
-	}else if (clearpad_is_valid_function(this, SYN_F12_2D)) {
-			rc = clearpad_get_block(SYNF(this, F12_2D, CTRL, 0x07),
-						buf, F12_2D_CTRL_RPT_REG_MAX);
-			if (rc) {
-				dev_err(&this->pdev->dev,
-				"failed to read control report register\n");
-				goto exit;
-			}
-			buf[F12_2D_CTRL_RPT_FLAG] = EW_RPT_GESTURE_DISABLE;
-			rc = clearpad_put_block(SYNF(this, F12_2D, CTRL, 0x07),
-						buf, F12_2D_CTRL_RPT_REG_MAX);
-			if (rc) {
-				dev_err(&this->pdev->dev,
-				"failed to disable report gesture\n");
-				goto exit;
-			}
-			rc = synaptics_clearpad_set_wakeup_gesture(this, 0);
-			if (rc) {
-				dev_err(&this->pdev->dev,
-				"failed to exit wakeup gesture mode\n");
-				goto exit;
-			}
-			if (this->chip_id == SYN_CHIP_3500 ||
-			    this->chip_id == SYN_CHIP_7500) {
-				rc = clearpad_put_bit(SYNF(this, F54_ANALOG,
-					COMMAND, 0x00),
-					ANALOG_COMMAND_FORCE_CAL,
-					ANALOG_COMMAND_FORCE_CAL);
-				if (rc) {
-					dev_err(&this->pdev->dev,
-					"failed to force calibrate\n");
-					goto exit;
-				}
-			}
-		}
-	} else {
-		rc = clearpad_vreg_suspend(this, 0);
-		if (rc)
-			goto exit;
-		usleep_range(10000, 11000);
-		clearpad_set_irq(this, this->pdt[SYN_F01_RMI].irq_mask,
-								true);
-		rc = clearpad_get(SYNF(this, F01_RMI, DATA, 0x01), &irq);
-		if (rc) {
-			dev_err(&this->pdev->dev,
-				"failed to read interrupt status\n");
-			goto exit;
-		}
+	}
 
 	rc = synaptics_put_bit(this, SYNF(F01_RMI, CTRL, 0x00),
 		DEVICE_CONTROL_SLEEP_MODE_NORMAL_OPERATION,
@@ -1884,39 +1808,20 @@ static int synaptics_clearpad_set_suspend_mode(struct synaptics_clearpad *this)
 
 	dev_dbg(&this->pdev->dev, "%s\n", __func__);
 
-	if (this->wakeup_gesture.engaged) {
+	if (this->easy_wakeup_config.gesture_enable) {
+		printk("Someone was here");
 		rc = synaptics_put_bit(this, SYNF(F11_2D, CTRL, 0x00),
 			XY_REPORTING_MODE_WAKEUP_GESTURE_MODE,
 			XY_REPORTING_MODE);
-		} else if (synaptics_clearpad_is_valid_function(this, SYN_F12_2D)) {
-			rc = synaptics_get_block(SYNF(this, F12_2D, CTRL, 0x07),
-						buf, F12_2D_CTRL_RPT_REG_MAX);
-			if (rc) {
-				dev_err(&this->pdev->dev,
-				"failed to read control report register\n");
-				goto exit;
-			}
-			buf[F12_2D_CTRL_RPT_FLAG] = EW_RPT_GESTURE_ENABLE;
-			rc = synaptics_put_block(SYNF(this, F12_2D, CTRL, 0x07),
-						buf, F12_2D_CTRL_RPT_REG_MAX);
-			if (!rc)
-				rc = synaptics_set_wakeup_gesture(this, 1);
-		}
 		if (rc) {
 			dev_err(&this->pdev->dev,
-				"failed to exit reduced reporting gesture mode\n");
+				"failed to exit reduced reporting mode\n");
 			goto exit;
 		}
 
-		this->wakeup_gesture.enabled = true;
-		this->wakeup_gesture.time_started = jiffies - 1;
+		this->ew_timeout = jiffies - 1;
 		usleep_range(10000, 11000);
 		LOG_CHECK(this, "enter doze mode\n");
-		if (!this->wakeup_gesture.lpm_disabled) {
-			rc = clearpad_vreg_suspend(this, 1);
-			if (rc)
-				goto exit;
-		}
 	} else {
 		rc = synaptics_put_bit(this, SYNF(F01_RMI, CTRL, 0x00),
 			DEVICE_CONTROL_SLEEP_MODE_SENSOR_SLEEP,
@@ -1925,17 +1830,15 @@ static int synaptics_clearpad_set_suspend_mode(struct synaptics_clearpad *this)
 			dev_err(&this->pdev->dev, "failed to exit normal mode\n");
 			goto exit;
 		}
-		this->wakeup_gesture.enabled = false;
 		usleep_range(10000, 11000);
 		synaptics_clearpad_set_irq(this,
 				this->pdt[SYN_F01_RMI].irq_mask, false);
 		LOG_CHECK(this, "enter sleep mode\n");
-		rc = clearpad_vreg_suspend(this, 1);
-		if (rc)
-			goto exit;
-	
 	}
 
+	rc = clearpad_vreg_suspend(this, 1);
+	if (rc)
+		goto exit;
 
 	this->active &= ~SYN_ACTIVE_POWER;
 	dev_info(&this->pdev->dev, "power OFF at suspend mode OK\n");
@@ -2314,57 +2217,6 @@ static int get_num_fingers_f12(struct synaptics_clearpad *this,
  	return rc;
  }
  
-static int synaptics_clearpad_read_fingers_f12(struct synaptics_clearpad *this)
-{
-	int rc, finger, num_fingers;
-	u8 buf[this->extents.n_fingers * this->extents.n_bytes_per_object];
-
-	memset(buf, 0, sizeof(buf));
-
-	rc = get_num_fingers_f12(this, &num_fingers);
-	if (rc)
-		goto err_ret;
-
-	if (num_fingers > 0) {
-		rc = synaptics_get_block(
-			SYNS(this, F12_2D, DATA, SENSED_OBJECTS),
-			buf, num_fingers * this->extents.n_bytes_per_object);
-		if (rc)
-			goto err_ret;
-	}
-
-	for (finger = 0; finger < this->extents.n_fingers; finger++)
-		synaptics_clearpad_report_finger_n(this, buf, finger);
-err_ret:
-	return rc;
-}
-static int synaptics_clearpad_handle_gesture(struct synaptics_clearpad *this)
-{
-	u8 wakeint = 0;
-	int rc = -EIO;
-
-	if (clearpad_is_valid_function(this, SYN_F11_2D)) {
-		rc = clearpad_get_block(SYNF3(this, F11_2D, DATA,
-		this->wakeup_gesture.large_panel ? 0x36 : 0x43),
-							&wakeint, 1);
-	} else if (clearpad_is_valid_function(this, SYN_F12_2D)) {
-		rc = clearpad_get(SYNF3(this, F12_2D, DATA, 0x02), &wakeint);
-	}
-	if (rc)
-		goto exit;
-
-	dev_info(&this->pdev->dev, "Gesture %d", wakeint);
-
-	if (time_after(jiffies, this->wakeup_gesture.time_started))
-		this->wakeup_gesture.time_started = jiffies +
-		msecs_to_jiffies(this->wakeup_gesture.timeout_delay);
-	else
-		goto exit;
-
-	evdt_execute(this->evdt_node, this->input, wakeint);
-exit:
-	return rc;
-}
 static void synaptics_funcarea_up(struct synaptics_clearpad *this,
 				  struct synaptics_pointer *pointer)
 {
@@ -2385,7 +2237,18 @@ static void synaptics_funcarea_up(struct synaptics_clearpad *this,
 		valid = idev->users > 0;
 		LOG_EVENT(this, "%s up\n", valid ? "pt" : "unused pt");
 		if (!valid)
-			break;		
+			break;
+
+		if (this->easy_wakeup_config.gesture_enable && !(this->active & SYN_ACTIVE_POWER)) {
+ 			LOG_CHECK(this, "D2W: difference: %u", jiffies_to_msecs(this->ew_timeout) - jiffies_to_msecs(jiffies));
+ 			if (time_after(jiffies, this->ew_timeout)) {
+ 				this->ew_timeout = jiffies + msecs_to_jiffies(this->easy_wakeup_config.timeout_delay);
+ 				LOG_CHECK(this, "D2W: now: %u | new timeout: %u", jiffies_to_msecs(jiffies), jiffies_to_msecs(this->ew_timeout));
+ 			} else {
+ 				LOG_CHECK(this, "D2W: Unlock!");
+ 				evdt_execute(this->evdt_node, this->input, 0102);
+ 			}
+		}			
 		input_mt_slot(idev, pointer->cur.id);
 		input_mt_report_slot_state(idev, pointer->cur.tool, false);
 		break;
@@ -2632,6 +2495,52 @@ exit:
 	return rc;
 }
 
+static int synaptics_clearpad_read_fingers_f12(struct synaptics_clearpad *this)
+{
+	int rc, finger, num_fingers;
+	u8 buf[this->extents.n_fingers * this->extents.n_bytes_per_object];
+
+	memset(buf, 0, sizeof(buf));
+
+	rc = get_num_fingers_f12(this, &num_fingers);
+	if (rc)
+		goto err_ret;
+
+	if (num_fingers > 0) {
+		rc = synaptics_read(SYNF2(this, F12_2D, DATA, SENSED_OBJECTS),
+			buf, num_fingers * this->extents.n_bytes_per_object);
+		if (rc)
+			goto err_ret;
+	}
+
+	for (finger = 0; finger < this->extents.n_fingers; finger++)
+		synaptics_report_finger_n(this, buf, finger);
+err_ret:
+	return rc;
+}
+
+static int synaptics_clearpad_handle_gesture(struct synaptics_clearpad *this)
+{
+	u8 wakeint;
+	int rc;
+
+	rc = synaptics_read(this, SYNF(F11_2D, DATA,
+			this->easy_wakeup_config.large_panel ? 0x39 : 0x43),
+			&wakeint, 1);
+	if (rc)
+		goto exit;
+
+	dev_info(&this->pdev->dev, "Gesture %d", wakeint);
+
+	if (time_after(jiffies, this->ew_timeout))
+		this->ew_timeout = jiffies + msecs_to_jiffies(
+			this->easy_wakeup_config.timeout_delay);
+	else
+		goto exit;
+	evdt_execute(this->evdt_node, this->input, wakeint);
+exit:
+	return rc;
+}
 
 static int synaptics_clearpad_process_F01_RMI(struct synaptics_clearpad *this)
 {
@@ -2684,9 +2593,10 @@ static int synaptics_clearpad_process_F11_2D(struct synaptics_clearpad *this)
 	int rc, i;
 	u8 status;
 
-	if (this->wakeup_gesture.enabled &&
+	if (this->easy_wakeup_config.gesture_enable &&
 	    !(this->active & SYN_ACTIVE_POWER)) {
 		rc = synaptics_clearpad_handle_gesture(this);
+		printk("Looks like no one came here");
 		goto exit;
 	}
 
@@ -2728,11 +2638,7 @@ static int synaptics_clearpad_process_F12_2D(struct synaptics_clearpad *this)
 {
 	int rc;
 	u8 status;
-	if (this->wakeup_gesture.enabled &&
-	    !(this->active & SYN_ACTIVE_POWER)) {
-		rc = synaptics_clearpad_handle_gesture(this);
-		goto exit;
-	}
+
 	rc = synaptics_read(this, SYNF(F01_RMI, DATA, 0x00), &status, 1);
 	LOG_CHECK(this, "rc=%d F01_RMI_DATA00=0x%x\n", rc, status);
 	if (rc)
@@ -2760,14 +2666,13 @@ static int synaptics_clearpad_process_irq(struct synaptics_clearpad *this)
 	u8 interrupt;
 
 	LOCK(this);
-	if (!this->wakeup_gesture.lpm_disabled) {
-		if (!(this->active & SYN_ACTIVE_POWER)) {
-			rc = clearpad_vreg_suspend(this, 0);
-			if (rc)
-				goto unlock;
-			usleep_range(10000, 11000);
-		}
+	if (!(this->active & SYN_ACTIVE_POWER)) {
+		rc = clearpad_vreg_suspend(this, 0);
+		if (rc)
+			goto unlock;
+		usleep_range(10000, 11000);
 	}
+
 	rc = synaptics_read(this, SYNF(F01_RMI, DATA, 0x01), &interrupt, 1);
 	LOG_CHECK(this, "rc=%d F01_RMI_DATA1=0x%x\n", rc, interrupt);
 	if (rc)
@@ -3203,7 +3108,7 @@ static ssize_t synaptics_clearpad_state_show(struct device *dev,
 	else if (!strncmp(attr->attr.name, __stringify(wakeup_gesture),
 		PAGE_SIZE))
 		snprintf(buf, PAGE_SIZE, "%d",
-			this->wakeup_gesture.enabled);
+			this->easy_wakeup_config.gesture_enable);
 	else if (!strncmp(attr->attr.name, __stringify(pen), PAGE_SIZE))
 		snprintf(buf, PAGE_SIZE,
 			"%d", this->pen_enabled);
@@ -3343,34 +3248,30 @@ static ssize_t synaptics_clearpad_pen_enabled_store(struct device *dev,
 	return rc ? rc : strnlen(buf, PAGE_SIZE);
 }
 
-
 static ssize_t synaptics_clearpad_wakeup_gesture_store(struct device *dev,
 		struct device_attribute *attr,
 		const char *buf, size_t size)
 {
-	int rc = 0;
 	struct synaptics_clearpad *this = dev_get_drvdata(dev);
 
 	dev_dbg(&this->pdev->dev, "%s: start\n", __func__);
 
 	LOCK(this);
 
-	if (!this->wakeup_gesture.supported) {
-		dev_info(&this->pdev->dev, "Wakeup gesture is not supported");
-		goto exit;
+	if (sysfs_streq(buf, "1")) {
+		this->easy_wakeup_config.gesture_enable = true;
+		device_init_wakeup(&this->pdev->dev, 1);
+	} else if (sysfs_streq(buf, "0")) {
+		this->easy_wakeup_config.gesture_enable = false;
+		device_init_wakeup(&this->pdev->dev, 0);
+	} else {
+		dev_err(&this->pdev->dev,
+			"illegal command in %s, buf is: %s\n",
+			buf, __func__);
 	}
 
-	this->wakeup_gesture.engaged = sysfs_streq(buf, "0") ? false : true;
-
-	device_init_wakeup(&this->pdev->dev,
-			this->wakeup_gesture.engaged ? 1 : 0);
-
-	dev_info(&this->pdev->dev, "wakeup gesture: %s",
-			this->wakeup_gesture.engaged ? "ENABLE" : "DISABLE");
-exit:
 	UNLOCK(this);
-
-	return rc ? rc : size;
+	return strnlen(buf, PAGE_SIZE);
 }
 
 static ssize_t synaptics_screen_status_store(struct device *dev,
@@ -3503,24 +3404,16 @@ static void clearpad_touch_config_dt(struct synaptics_clearpad *this)
 		dev_warn(&this->pdev->dev, "no por_delay_after config\n");
 
 	if (of_property_read_bool(devnode, "large_panel"))
-		this->wakeup_gesture.large_panel = true;
+		this->easy_wakeup_config.large_panel = true;
 else
 		dev_warn(&this->pdev->dev, "no large_panel\n");
 
-	if (of_property_read_u32(devnode, "wakeup_gesture_supported",
-		(u32 *)&this->wakeup_gesture.supported))
-		dev_warn(&this->pdev->dev, "no wakeup_gesture_supported\n");
-
-	if (of_property_read_u32(devnode, "wakeup_gesture_large_panel",
-		(u32 *)&this->wakeup_gesture.large_panel))
-		dev_warn(&this->pdev->dev, "no wakeup_gesture_large_panel\n");
-
-	if (of_property_read_u32(devnode, "wakeup_gesture_lpm_disabled",
-		(u32 *)&this->wakeup_gesture.lpm_disabled))
-		dev_warn(&this->pdev->dev, "no wakeup_gesture_lpm_disabled\n");
+	if (of_property_read_u32(devnode, "wakeup_gesture_support",
+		&this->wakeup_gesture_support))
+		dev_warn(&this->pdev->dev, "no wakeup_gesture_support\n");
 
 	if (of_property_read_u32(devnode, "wakeup_gesture_timeout",
- 		&this->wakeup_gesture.timeout_delay))
+ 		&this->easy_wakeup_config.timeout_delay))
 		dev_warn(&this->pdev->dev, "no wakeup_gesture_timeout\n");
 }
 
@@ -3554,7 +3447,7 @@ static void synaptics_clearpad_input_ev_init(struct synaptics_clearpad *this)
 {
 	int rc = 0;
 
-	if (this->wakeup_gesture.supported) {
+	if (this->wakeup_gesture_support) {
 		this->evdt_node = evdt_initialize(this->bdata->dev, this->input,
 						SYNAPTICS_WAKEUP_GESTURE);
 		if (!this->evdt_node) {
@@ -4300,6 +4193,11 @@ static int __devinit clearpad_probe(struct platform_device *pdev)
 
 	if (this->bdata->of_node)
 		clearpad_touch_config_dt(this);
+
+	if (this->pdata->easy_wakeup_config)
+		memcpy(&this->easy_wakeup_config,
+			this->pdata->easy_wakeup_config,
+			sizeof(this->easy_wakeup_config));
 
 #ifdef CONFIG_TOUCHSCREEN_CLEARPAD_RMI_DEV
 	if (!cdata->rmi_dev) {
