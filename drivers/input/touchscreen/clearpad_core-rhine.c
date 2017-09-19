@@ -4232,7 +4232,7 @@ static int __devinit clearpad_probe(struct platform_device *pdev)
 		clearpad_touch_config_dt(this);
 
 	if (this->pdata->easy_wakeup_config)
-		memcpy(&this->easy_wakeup_config,v
+		memcpy(&this->easy_wakeup_config,
 			this->pdata->easy_wakeup_config,
 			sizeof(this->easy_wakeup_config));
 	this->easy_wakeup_config.gesture_enable = true;
